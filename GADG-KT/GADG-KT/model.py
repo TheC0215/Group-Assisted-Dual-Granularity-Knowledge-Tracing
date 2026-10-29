@@ -48,7 +48,15 @@ class GADGKT(nn.Module):
         self.max_interval = max_interval
         self.interval_embed = nn.Embedding(max_interval + 1, d)
         self.skill_forget = nn.Sequential(
-            nn.Linear(3 * d, d),
+            nn.Linear(2 * d, d),
+            nn.ReLU(),
+            nn.Dropout(p),
+            nn.Linear(d, d)
+        )
+
+        # 题目层面遗忘（与知识点层面做法一致：间隔嵌入复用同一张表，MLP 独立）
+        self.ques_forget = nn.Sequential(
+            nn.Linear(2 * d, d),
             nn.ReLU(),
             nn.Dropout(p),
             nn.Linear(d, d)
@@ -112,7 +120,7 @@ class GADGKT(nn.Module):
         ws = w / (denom_sk[self.E_skill] + 1e-8)
         agg = torch.zeros_like(self.skill_node_feat).index_add_(
             0, self.E_skill, ws.unsqueeze(-1) * int_h[self.E_int])
-        skill_emb = self.skill_gnn_l2(agg) + self.skill_node_feat  # layer2 + 残差（技能种子特征）
+        skill_emb = agg + self.skill_gnn_l2(self.skill_node_feat)  # layer2 + 残差（技能种子特征）
         return skill_emb
 
     def forward(self, last_problem, last_ans, next_problem, next_ans, int_ids=None):
@@ -154,6 +162,8 @@ class GADGKT(nn.Module):
         c_ques = torch.zeros_like(h_ques)
         # 每个知识点"上一次作答"的位置（-1 表示从未做过，首次出现间隔记 0）
         last_seen = torch.full((batch, self.skill_max), -1, dtype=torch.long, device=device)
+        # 每个学生每道题"上一次作答"的位置（-1 表示从未做过，首次出现间隔记 0）
+        last_seen_ques = torch.full((batch, self.pro_max), -1, dtype=torch.long, device=device)
 
         res_p = []
         res_attn = []
@@ -174,12 +184,22 @@ class GADGKT(nn.Module):
             iv = self.interval_embed(delta)                    # batch skill d
             h_rel = h_skill[rel_mask]                          # (K, d) 相关技能状态
             iv_rel = iv[rel_mask]  # (K, d)
-            hq_rel = h_ques.unsqueeze(1).expand(-1, self.skill_max, -1)[rel_mask]  # (K, d) 全局知识状态广播
 
-            h_forg = self.skill_forget(torch.cat([h_rel, iv_rel, hq_rel], dim=-1))  # (K, d)
+            h_forg = self.skill_forget(torch.cat([h_rel, iv_rel], dim=-1))  # (K, d)
             h_skill = h_skill.masked_scatter(rel_mask.unsqueeze(-1), h_forg)  # 遗忘写回状态矩阵
 
-            # 1.2) 细粒度检索（照旧）：Q 作 query，遗忘后的 h_skill 作 K/V
+            # 1.2) 题目层面遗忘（与知识点层面做法一致）：
+            # 第一次做该题 → 间隔 0；否则 = 当前步 - 上次做该题的时刻，截断到 max_interval
+            cur_seen = last_seen_ques[torch.arange(batch, device=device), now_pro]  # batch（该学生上次做该题的时刻）
+            dq = now_step - cur_seen
+            dq = torch.where(cur_seen < 0, torch.zeros_like(dq), dq)  # 首次出现间隔=0
+            dq = dq.clamp(0, self.max_interval)
+            iv_q = self.interval_embed(dq)                          # batch d
+            hq_forg = self.ques_forget(torch.cat([h_ques, iv_q], dim=-1))  # batch d
+            # 遗忘写回（真实步才写；padding 步保持原状）
+            h_ques = is_real * hq_forg + (1 - is_real) * h_ques
+
+            # 1.3) 细粒度检索（照旧）：Q 作 query，遗忘后的 h_skill 作 K/V
             f1 = now_pro_embed.unsqueeze(1)  # batch 1 d
             now_pro_skill_attn = torch.matmul(f1, h_skill.transpose(-1, -2)) / f1.shape[-1]
             now_pro_skill_attn = torch.masked_fill(now_pro_skill_attn, now_pro2skill == 0, -1e9)
@@ -226,6 +246,10 @@ class GADGKT(nn.Module):
             hq_new, cq_new = self.ques_lstm(ques_in, (h_ques, c_ques))
             h_ques = is_real * hq_new + (1 - is_real) * h_ques
             c_ques = is_real * cq_new + (1 - is_real) * c_ques
+
+            # 记录题目层"上一次作答"位置（只对真实步）
+            upd_q = now_pro != 0
+            last_seen_ques[torch.arange(batch, device=device)[upd_q], now_pro[upd_q]] = now_step
 
             # ============ 3) 累积图缓冲（训练+真实步，做完题后的状态，detach） ============
             if self.training:
